@@ -21,6 +21,7 @@ Desktop.ini
 /test/results_*.dat
 /test/deps
 
+Manifest.toml
 *.expmap
 *.exe
 *.dll
