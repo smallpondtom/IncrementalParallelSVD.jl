@@ -18,20 +18,26 @@ mutable struct IncrementalSVDStandard <: AbstractIncrementalSVD
     end
 end
 
-function take_sample!(svd_obj::IncrementalSVDStandard, u::Vector{Float64}; add_without_increase::Bool=false)
-    @assert length(u) == svd_obj.base.dim "Input vector dimension mismatch"
+function take_sample!(svd_obj::IncrementalSVDStandard, u_local::Vector{Float64}; add_without_increase::Bool=false)
+    @assert length(u_local) == svd_obj.base.dim "Input vector dimension mismatch"
     
-    # Check if input is non-zero
-    if norm(u) ≈ 0.0
+    # Check if input is non-zero (global norm)
+    local_norm_sq = dot(u_local, u_local)
+    global_norm_sq = local_norm_sq
+    if MPI.Initialized() && svd_obj.base.comm_size > 1
+        global_norm_sq = MPI.Allreduce(local_norm_sq, MPI.SUM, MPI.COMM_WORLD)
+    end
+    
+    if sqrt(global_norm_sq) ≈ 0.0
         return false
     end
     
     # Build initial SVD or add incremental sample
     if svd_obj.base.is_first_sample
-        build_initial_svd!(svd_obj, u)
+        build_initial_svd!(svd_obj, u_local)
         svd_obj.base.is_first_sample = false
     else
-        result = build_incremental_svd!(svd_obj, u, add_without_increase)
+        result = build_incremental_svd!(svd_obj, u_local, add_without_increase)
         if !result
             return false
         end
@@ -63,18 +69,24 @@ function restore_standard_state!(svd_obj::IncrementalSVDStandard)
 end
 
 """
-    build_initial_svd!(svd_obj::IncrementalSVDStandard, u::Vector{Float64})
+    build_initial_svd!(svd_obj::IncrementalSVDStandard, u_local::Vector{Float64})
 
-Build initial SVD for Standard algorithm.
+Build initial SVD for Standard algorithm using distributed vector u_local.
 """
-function build_initial_svd!(svd_obj::IncrementalSVDStandard, u::Vector{Float64})
-    norm_u = norm(u)
+function build_initial_svd!(svd_obj::IncrementalSVDStandard, u_local::Vector{Float64})
+    # Compute global norm
+    local_norm_sq = dot(u_local, u_local)
+    global_norm_sq = local_norm_sq
+    if MPI.Initialized() && svd_obj.base.comm_size > 1
+        global_norm_sq = MPI.Allreduce(local_norm_sq, MPI.SUM, MPI.COMM_WORLD)
+    end
+    norm_u = sqrt(global_norm_sq)
     
     # Initialize S
     svd_obj.base.S = [norm_u]
     
-    # Initialize U
-    svd_obj.base.U = reshape(u / norm_u, :, 1)
+    # Initialize U (local portion)
+    svd_obj.base.U = reshape(u_local / norm_u, :, 1)
     
     # Initialize W if needed
     if svd_obj.base.update_right_SV
@@ -94,7 +106,7 @@ end
 Compute basis for Standard algorithm (direct copy of U and W).
 """
 function compute_basis!(svd_obj::IncrementalSVDStandard)
-    # Direct copy for standard algorithm
+    # Direct copy for standard algorithm (local operation)
     svd_obj.base.basis = copy(svd_obj.base.U)
     
     if svd_obj.base.update_right_SV
@@ -113,15 +125,15 @@ function add_linearly_dependent_sample!(svd_obj::IncrementalSVDStandard, A::Matr
     # Extract submatrices
     A_mod = A[1:n, 1:n]
     
-    # Update singular values
+    # Update singular values (replicated operation)
     for i in 1:n
         svd_obj.base.S[i] = sigma[i, i]
     end
     
-    # Update U
+    # Update U (local operation - each processor updates its portion)
     svd_obj.base.U = svd_obj.base.U * A_mod
     
-    # Update W if needed
+    # Update W if needed (replicated operation)
     if svd_obj.base.update_right_SV
         new_W = zeros(svd_obj.base.num_rows_of_W + 1, n)
         
@@ -141,31 +153,31 @@ function add_linearly_dependent_sample!(svd_obj::IncrementalSVDStandard, A::Matr
         svd_obj.base.num_rows_of_W += 1
     end
     
-    # Reorthogonalize if necessary
+    # Reorthogonalize if necessary (distributed check for U)
     max_dim = max(svd_obj.base.num_samples, svd_obj.base.total_dim)
     tol = eps(Float64) * max_dim
     
-    if abs(check_orthogonality(svd_obj.base.U)) > tol
+    if abs(check_orthogonality(svd_obj.base.U, svd_obj.base.comm_size)) > tol
         F = qr(svd_obj.base.U)
         svd_obj.base.U = Matrix(F.Q)
     end
 end
 
 """
-    add_new_sample!(svd_obj::IncrementalSVDStandard, j::Vector{Float64}, A::Matrix{Float64}, W::Matrix{Float64}, sigma::Matrix{Float64})
+    add_new_sample!(svd_obj::IncrementalSVDStandard, j_local::Vector{Float64}, A::Matrix{Float64}, W::Matrix{Float64}, sigma::Matrix{Float64})
 
-Add new linearly independent sample for Standard algorithm.
+Add new linearly independent sample for Standard algorithm (j_local is the local portion).
 """
-function add_new_sample!(svd_obj::IncrementalSVDStandard, j::Vector{Float64}, A::Matrix{Float64}, W::Matrix{Float64}, sigma::Matrix{Float64})
+function add_new_sample!(svd_obj::IncrementalSVDStandard, j_local::Vector{Float64}, A::Matrix{Float64}, W::Matrix{Float64}, sigma::Matrix{Float64})
     n = svd_obj.base.num_samples
     
-    # Create temporary matrix with j as new column
-    tmp = hcat(svd_obj.base.U, j)
+    # Create temporary matrix with j_local as new column (local operation)
+    tmp = hcat(svd_obj.base.U, j_local)
     
-    # Multiply by A to get new U
+    # Multiply by A to get new U (local operation)
     svd_obj.base.U = tmp * A
     
-    # Update W if needed
+    # Update W if needed (replicated operation)
     if svd_obj.base.update_right_SV
         new_W = zeros(svd_obj.base.num_rows_of_W + 1, n + 1)
         
@@ -184,7 +196,7 @@ function add_new_sample!(svd_obj::IncrementalSVDStandard, j::Vector{Float64}, A:
         svd_obj.base.W = new_W
     end
     
-    # Update singular values
+    # Update singular values (replicated operation)
     num_dim = min(size(sigma, 1), size(sigma, 2))
     svd_obj.base.S = [sigma[i, i] for i in 1:num_dim]
     
@@ -196,32 +208,45 @@ function add_new_sample!(svd_obj::IncrementalSVDStandard, j::Vector{Float64}, A:
     max_dim = max(svd_obj.base.num_samples, svd_obj.base.total_dim)
     tol = eps(Float64) * max_dim
     
-    if abs(check_orthogonality(svd_obj.base.U)) > tol
+    # U is distributed, so check globally
+    if abs(check_orthogonality(svd_obj.base.U, svd_obj.base.comm_size)) > tol
         F = qr(svd_obj.base.U)
         svd_obj.base.U = Matrix(F.Q)
     end
     
-    if svd_obj.base.update_right_SV && abs(check_orthogonality(svd_obj.base.W)) > eps(Float64) * svd_obj.base.num_samples
+    # W is replicated, so check locally
+    if svd_obj.base.update_right_SV && abs(check_orthogonality(svd_obj.base.W, 1)) > eps(Float64) * svd_obj.base.num_samples
         F = qr(svd_obj.base.W)
         svd_obj.base.W = Matrix(F.Q)
     end
 end
 
 """
-    build_incremental_svd!(svd_obj::IncrementalSVDStandard, u::Vector{Float64}, add_without_increase::Bool)
+    build_incremental_svd!(svd_obj::IncrementalSVDStandard, u_local::Vector{Float64}, add_without_increase::Bool)
 
-Standard incremental SVD implementation.
+Standard incremental SVD implementation for distributed vectors.
 """
-function build_incremental_svd!(svd_obj::IncrementalSVDStandard, u::Vector{Float64}, add_without_increase::Bool)
-    # Compute projection: l = U' * u
-    l = svd_obj.base.U' * u
+function build_incremental_svd!(svd_obj::IncrementalSVDStandard, u_local::Vector{Float64}, add_without_increase::Bool)
+    # Compute projection: l = U' * u (requires global communication)
+    l_local = svd_obj.base.U' * u_local
+    l = copy(l_local)
+    if MPI.Initialized() && svd_obj.base.comm_size > 1
+        MPI.Allreduce!(l, MPI.SUM, MPI.COMM_WORLD)
+    end
     
-    # Compute basis projection: basis_l = U * l
-    basis_l = svd_obj.base.U * l
+    # Compute basis projection: basis_l = U * l (local computation)
+    basis_l_local = svd_obj.base.U * l
     
     # Compute residual more accurately to avoid catastrophic cancellation
-    e_proj = u - basis_l
-    k = norm(e_proj)
+    e_proj_local = u_local - basis_l_local
+    
+    # Compute global norm of residual
+    k_local_sq = dot(e_proj_local, e_proj_local)
+    k_global_sq = k_local_sq
+    if MPI.Initialized() && svd_obj.base.comm_size > 1
+        k_global_sq = MPI.Allreduce(k_local_sq, MPI.SUM, MPI.COMM_WORLD)
+    end
+    k = sqrt(k_global_sq)
     
     if k <= 0
         if svd_obj.base.comm_rank == 0
@@ -267,9 +292,9 @@ function build_incremental_svd!(svd_obj::IncrementalSVDStandard, u::Vector{Float
             end
             add_linearly_dependent_sample!(svd_obj, A, W, sigma)
         elseif !linearly_dependent
-            # Compute normalized residual direction
-            j = e_proj / k
-            add_new_sample!(svd_obj, j, A, W, sigma)
+            # Compute normalized residual direction (local portion)
+            j_local = e_proj_local / k
+            add_new_sample!(svd_obj, j_local, A, W, sigma)
         end
         
         # Compute basis vectors
