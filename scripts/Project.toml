@@ -1,0 +1,9 @@
+[deps]
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+IncrementalParallelSVD = "bf12dbf0-4169-4592-9640-a5612f00cfeb"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+
+[compat]
+LinearAlgebra = "1.11.0"
+MPI = "0.20.22"
